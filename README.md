@@ -1,1 +1,1 @@
-# articulated-part-induction
+# Deep Part Induction from Articulated Object Pairs
