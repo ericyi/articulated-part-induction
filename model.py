@@ -344,6 +344,22 @@ def hungarian_matching(pred_x, gt_x, curnmasks):
         matching_idx[i,:curnmask,1] = col_ind
     return matching_idx
 
+def iou(pred_x, gt_x, gt_conf, nsmp=128, nmask=10):
+    matching_idx = tf.stop_gradient(tf.py_func(hungarian_matching, [pred_x, gt_x, tf.reduce_sum(gt_conf,[1,2])], tf.int32)) # B x nmask x 2
+    matching_idx_row = matching_idx[:,:,0]
+    idx = tf.where(tf.greater_equal(matching_idx_row,0))
+    matching_idx_row = tf.concat((tf.expand_dims(tf.cast(idx[:,0],tf.int32),-1),tf.reshape(matching_idx_row,[-1,1])),1)
+    gt_x_matched = tf.reshape(tf.gather_nd(gt_x, matching_idx_row), [-1, nmask, nsmp])
+    matching_idx_column = matching_idx[:,:,1]
+    idx = tf.where(tf.greater_equal(matching_idx_column,0))
+    matching_idx_column = tf.concat((tf.expand_dims(tf.cast(idx[:,0],tf.int32),-1),tf.reshape(matching_idx_column,[-1,1])),1)
+    pred_x_matched = tf.reshape(tf.gather_nd(pred_x, matching_idx_column), [-1, nmask, nsmp])
+    # comput meaniou
+    matching_score = tf.reduce_sum(tf.multiply(gt_x_matched, pred_x_matched),2)
+    iou_all = tf.divide(matching_score,tf.reduce_sum(gt_x_matched,2)+tf.reduce_sum(pred_x_matched,2)-matching_score+1e-8)
+    meaniou = tf.divide(tf.reduce_sum(tf.multiply(iou_all, tf.squeeze(gt_conf,2)),1), tf.reduce_sum(gt_conf,[1,2])+1e-8) # B
+    return meaniou
+
 def get_model_loss_stage1(pcpair, gt_vismask, gt_flow, momasks, is_training, bn_decay=None, nfea=64, ntransfea=12, nsmp1=256, nsmp2=128):
     ###############################################################
     # Train the correspondence proposal module and the flow module.
@@ -398,11 +414,13 @@ def get_model_loss_stage3(pcpair, gt_vismask, gt_flow, momasks, is_training, bn_
     xyz, xyz2 = tf.split(pcpair, [3, 3], axis=2)
     corrsfea = corrsfea_extractor(tf.concat((xyz,xyz2),0), tf.constant(False), None, 'CorrsFeaExtractor', False, nfea=nfea)
     corrsfea1, corrsfea2  = tf.split(corrsfea, 2, 0)
-    pred_flow, _, _, _, _ = corrs_flow_pred_net(xyz, xyz2, corrsfea1, corrsfea2, 'CorrsFlowNet', False, tf.constant(False), None, nsmp=nsmp1, nfea=nfea)
+    pred_flow, pred_vismask, _, _, _ = corrs_flow_pred_net(xyz, xyz2, corrsfea1, corrsfea2, 'CorrsFlowNet', False, tf.constant(False), None, nsmp=nsmp1, nfea=nfea)
     pred_flow = tf.stop_gradient(pred_flow)
+    pred_vismask = tf.stop_gradient(pred_vismask)
 
     pred_trans = trans_pred_net(xyz, pred_flow, 'TransNet', False, tf.constant(False), None, nfea=ntransfea)
-    pred_grouping_sub, fpsidx = grouping_pred_net(xyz, pred_flow, tf.stop_gradient(pred_trans), 'GroupingNet', False, tf.constant(False), None, nsmp=nsmp2)
+    pred_trans = tf.stop_gradient(pred_trans)
+    pred_grouping_sub, fpsidx = grouping_pred_net(xyz, pred_flow, pred_trans, 'GroupingNet', False, tf.constant(False), None, nsmp=nsmp2)
     pred_grouping_sub = tf.stop_gradient(pred_grouping_sub)
     fpsidx = tf.stop_gradient(fpsidx)
 
@@ -413,31 +431,22 @@ def get_model_loss_stage3(pcpair, gt_vismask, gt_flow, momasks, is_training, bn_
     momasks_sub = tf.reshape(tf.gather_nd(momasks, fpsidx), [-1, nsmp, nmask])
     gt_conf_sub = tf.stop_gradient(tf.cast(tf.greater(tf.expand_dims(tf.reduce_sum(momasks_sub,1),-1),0),tf.float32)) # B x nmask x 1
     gt_seg_sub = tf.transpose(momasks_sub,perm=[0,2,1]) # B x nmask x nsmp
-
     pred_seg_sub, pred_conf = seg_pred_net(xyz, pred_grouping_sub, fpsidx, 'SegNet', False, is_training, bn_decay, nmask=nmask)
-    matching_idx = tf.stop_gradient(tf.py_func(hungarian_matching, [pred_seg_sub, gt_seg_sub, tf.reduce_sum(gt_conf_sub,[1,2])], tf.int32)) # B x nmask x 2
-    matching_idx_row = matching_idx[:,:,0]
-    idx = tf.where(tf.greater_equal(matching_idx_row,0))
-    matching_idx_row = tf.concat((tf.expand_dims(tf.cast(idx[:,0],tf.int32),-1),tf.reshape(matching_idx_row,[-1,1])),1)
-    gt_seg_matched = tf.reshape(tf.gather_nd(gt_seg_sub, matching_idx_row), [-1, nmask, nsmp])
-    matching_idx_column = matching_idx[:,:,1]
-    idx = tf.where(tf.greater_equal(matching_idx_column,0))
-    matching_idx_column = tf.concat((tf.expand_dims(tf.cast(idx[:,0],tf.int32),-1),tf.reshape(matching_idx_column,[-1,1])),1)
-    pred_seg_matched = tf.reshape(tf.gather_nd(pred_seg_sub, matching_idx_column), [-1, nmask, nsmp])
-    # comput iou
-    matching_score = tf.reduce_sum(tf.multiply(gt_seg_matched, pred_seg_matched),2)
-    negiou = -tf.divide(matching_score,tf.reduce_sum(gt_seg_matched,2)+tf.reduce_sum(pred_seg_matched,2)-matching_score+1e-8)
-    negiou = tf.divide(tf.reduce_sum(tf.multiply(negiou, tf.squeeze(gt_conf_sub,2)),1), tf.reduce_sum(gt_conf_sub,[1,2])+1e-8) # B
+    negiou = -iou(pred_seg_sub, gt_seg_sub, gt_conf_sub, nsmp, nmask)
     loss_seg = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.squeeze(gt_conf_sub,2), logits=tf.squeeze(pred_conf,2)),1) # B
-    loss_seg = loss_seg+negiou
     loss_seg = tf.reduce_mean(loss_seg)
-    return pred_seg_sub, pred_conf, loss_seg
+    negiou = tf.reduce_mean(negiou)
+    loss = loss_seg+negiou
+    return pred_seg_sub, pred_conf, loss, loss_seg, negiou
 
 def eva_flow(pcpair, nfea=64, ntransfea=12, nsmp1=256, nsmp2=128):
     ###########################################################
     # Evaluate the deformation flow between a point cloud pair.
     # input
     #   pcpair: (B x N x 6)
+    # output
+    #   pred_flow: (B x N x 3)
+    #   pred_vismask: (B x N)
     ###########################################################
     num_point = pcpair.get_shape()[1].value
     xyz, xyz2 = tf.split(pcpair, [3, 3], axis=2)
@@ -452,6 +461,11 @@ def eva_seg(pcpair, pred_flow, nfea=64, ntransfea=12, nsmp1=256, nsmp2=128, nmas
     # equipped with a deformation flow.
     # input
     #   pcpair: (B x N x 6)
+    # output
+    #   pred_trans: (B x N x ntransfea)
+    #   pred_grouping: (B x N x N)
+    #   pred_seg: (B x nmask x N)
+    #   pred_conf: (B x nmask x 1)
     #####################################################
     num_point = pcpair.get_shape()[1].value
     xyz, xyz2 = tf.split(pcpair, [3, 3], axis=2)
@@ -461,10 +475,11 @@ def eva_seg(pcpair, pred_flow, nfea=64, ntransfea=12, nsmp1=256, nsmp2=128, nmas
     pred_conf = tf.nn.sigmoid(pred_conf)
     xyz_sub = tf.reshape(tf.gather_nd(xyz, fpsidx), [-1, nsmp2, 3])
     #### up sample
+    pred_grouping = interp_grouping(xyz, pred_grouping_sub, fpsidx, nsmp2, 'InterpNet', False)
     pred_seg = tf.transpose(pred_seg_sub, perm=[0,2,1]) # B x nsmp x nmask
     pred_seg = pointnet_fp_module(xyz, xyz_sub, None, pred_seg, [], tf.constant(True), None, scope='interp_layer_seg')
     pred_seg = tf.transpose(pred_seg, perm=[0,2,1]) # B x nmask x npoint
-    return pred_seg, pred_conf
+    return pred_trans, pred_grouping, pred_seg, pred_conf
 
 if __name__=='__main__':
     with tf.Graph().as_default():
