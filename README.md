@@ -22,3 +22,7 @@ Train the hypothesis selection submodule through
 Evaluate the model through
 
     python evaluation.py
+    
+You can also download the pretrained model from the following link:
+
+    https://shapenet.cs.stanford.edu/ericyi/pretrained_model_partmob.zip
